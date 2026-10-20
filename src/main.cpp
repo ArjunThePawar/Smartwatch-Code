@@ -1,5 +1,6 @@
-#include <Arduino.h>  // MANDATORY: PlatformIO requires this at the absolute top
 #include <WiFi.h>
+#include <Wire.h>
+#include "MAX30105.h"
 
 enum ContextState {
   STATE_IDLE,
@@ -9,62 +10,67 @@ enum ContextState {
   STATE_EXAM
 };
 
-// Use unsigned long instead of uint32_t for millis tracking to prevent compiler mismatch warnings
-const unsigned long SCAN_INTERVAL_MS = 15000;
-const unsigned long HAPTIC_INTERVAL_MS = 500;
-const unsigned long LOG_INTERVAL_MS = 5000;
+const uint32_t SCAN_INTERVAL_MS = 15000;
+const uint32_t HAPTIC_INTERVAL_MS = 500;
+const uint32_t LOG_INTERVAL_MS = 5000;
+const uint32_t SENSOR_INTERVAL_MS = 50;
 
 const int THRESHOLD_CROWD = 15;
 const int THRESHOLD_COMMUTE = 8;
 const int THRESHOLD_EXAM = 3;
 const int THRESHOLD_BURNOUT = 1;
 
+const int BPM_STRESS_LIMIT = 100;
+const long FINGER_IR_MIN = 50000;
+const float PEAK_MIN_AMPLITUDE = 150.0f;
+const uint32_t BEAT_MIN_MS = 300;
+const uint32_t BEAT_MAX_MS = 2000;
+const int BPM_AVG_SIZE = 4;
+
+const uint8_t PIN_SDA = 21;
+const uint8_t PIN_SCL = 22;
+
+MAX30105 particleSensor;
+
 ContextState currentState = STATE_IDLE;
 ContextState previousState = STATE_IDLE;
 
-unsigned long lastScanMs = 0;
-unsigned long lastHapticMs = 0;
-unsigned long lastLogMs = 0;
+uint32_t lastScanMs = 0;
+uint32_t lastHapticMs = 0;
+uint32_t lastLogMs = 0;
+uint32_t lastSensorMs = 0;
 
 bool scanInProgress = false;
+bool sensorReady = false;
 int networkTotal = 0;
 
-// ADDED DEBUG LOGS: These empty placeholders now print text to your screen so you can verify the route works!
+float baselineIR = 0.0f;
+float sigPrev = 0.0f;
+float sigPrevPrev = 0.0f;
+uint32_t lastBeatMs = 0;
+int bpmHistory[BPM_AVG_SIZE] = {0};
+int bpmIndex = 0;
+int bpmCount = 0;
+int currentBPM = 0;
+long lastIR = 0;
+
 void triggerCrowdAlert() {
-  // Aromal will later plug in LRA haptic sine waves here
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 2000) {
-    Serial.println("[HAPTIC] Running: Silent 60 BPM Stealth Pacing...");
-    lastPrint = millis();
-  }
 }
 
 void triggerStealthPacing() {
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 2000) {
-    Serial.println("[HAPTIC] Running: Sharp Asymmetric Loops...");
-    lastPrint = millis();
-  }
 }
 
 void triggerCommuteNudge() {
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 2000) {
-    Serial.println("[HAPTIC] Running: Heavy Continuous Somatic Waves...");
-    lastPrint = millis();
-  }
 }
 
 void triggerExamFocus() {
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 2000) {
-    Serial.println("[HAPTIC] Running: 4-Second Tactile Box-Breathing...");
-    lastPrint = millis();
-  }
 }
 
 void triggerIdleHaptic() {
-  // Idle state remains silent
+}
+
+bool isStationary() {
+  return true;
 }
 
 const char* stateToString(ContextState state) {
@@ -78,6 +84,12 @@ const char* stateToString(ContextState state) {
 }
 
 ContextState classifyEnvironment(int total) {
+  if (currentBPM > BPM_STRESS_LIMIT && isStationary()) {
+    if (total > THRESHOLD_CROWD) {
+      return STATE_CROWD;
+    }
+    return STATE_EXAM;
+  }
   if (total > THRESHOLD_CROWD) {
     return STATE_CROWD;
   }
@@ -93,9 +105,97 @@ ContextState classifyEnvironment(int total) {
   return STATE_IDLE;
 }
 
+void updateState() {
+  previousState = currentState;
+  currentState = classifyEnvironment(networkTotal);
+  if (currentState != previousState) {
+    Serial.print("[ROUTE] ");
+    Serial.print(stateToString(previousState));
+    Serial.print(" -> ");
+    Serial.println(stateToString(currentState));
+  }
+}
+
+void resetPulseTracking() {
+  baselineIR = 0.0f;
+  sigPrev = 0.0f;
+  sigPrevPrev = 0.0f;
+  lastBeatMs = 0;
+  bpmIndex = 0;
+  bpmCount = 0;
+  currentBPM = 0;
+  for (int i = 0; i < BPM_AVG_SIZE; i++) {
+    bpmHistory[i] = 0;
+  }
+}
+
+void registerBeat(uint32_t nowMs) {
+  if (lastBeatMs != 0) {
+    uint32_t interval = nowMs - lastBeatMs;
+    if (interval >= BEAT_MIN_MS && interval <= BEAT_MAX_MS) {
+      int instantBPM = (int)(60000UL / interval);
+      bpmHistory[bpmIndex] = instantBPM;
+      bpmIndex = (bpmIndex + 1) % BPM_AVG_SIZE;
+      if (bpmCount < BPM_AVG_SIZE) {
+        bpmCount++;
+      }
+      long sum = 0;
+      for (int i = 0; i < bpmCount; i++) {
+        sum += bpmHistory[i];
+      }
+      currentBPM = (int)(sum / bpmCount);
+    } else if (interval > BEAT_MAX_MS) {
+      bpmCount = 0;
+      bpmIndex = 0;
+      currentBPM = 0;
+    } else {
+      return;
+    }
+  }
+  lastBeatMs = nowMs;
+}
+
+void processSample(long irValue, uint32_t nowMs) {
+  lastIR = irValue;
+
+  if (irValue < FINGER_IR_MIN) {
+    resetPulseTracking();
+    return;
+  }
+
+  if (baselineIR == 0.0f) {
+    baselineIR = (float)irValue;
+  }
+  baselineIR = (baselineIR * 0.95f) + ((float)irValue * 0.05f);
+
+  float signal = (float)irValue - baselineIR;
+
+  if (sigPrev > sigPrevPrev && sigPrev >= signal && sigPrev > PEAK_MIN_AMPLITUDE) {
+    registerBeat(nowMs);
+  }
+
+  sigPrevPrev = sigPrev;
+  sigPrev = signal;
+}
+
+void pollSensor(uint32_t nowMs) {
+  if (!sensorReady) {
+    return;
+  }
+
+  particleSensor.check();
+
+  while (particleSensor.available()) {
+    long irValue = (long)particleSensor.getFIFOIR();
+    processSample(irValue, nowMs);
+    particleSensor.nextSample();
+  }
+
+  updateState();
+}
+
 void startScan() {
-  // Setup client-side transient background scanning parameters cleanly
-  WiFi.scanNetworks(true, false, false, 150); 
+  WiFi.scanNetworks(true);
   scanInProgress = true;
   lastScanMs = millis();
 }
@@ -107,8 +207,7 @@ void pollScan() {
 
   int result = WiFi.scanComplete();
 
-  // Handle the specific variable parameters returned by the Espressif core
-  if (result == WIFI_SCAN_RUNNING || result == -1) {
+  if (result == WIFI_SCAN_RUNNING) {
     return;
   }
 
@@ -116,23 +215,16 @@ void pollScan() {
 
   if (result >= 0) {
     networkTotal = result;
-    previousState = currentState;
-    currentState = classifyEnvironment(networkTotal);
+    updateState();
 
-    Serial.print("[SCAN] Networks Found: ");
-    Serial.println(networkTotal);
-
-    if (currentState != previousState) {
-      Serial.print("[ROUTE] State Altered: ");
-      Serial.print(stateToString(previousState));
-      Serial.print(" -> ");
-      Serial.println(stateToString(currentState));
-    }
+    Serial.print("[SCAN] Networks: ");
+    Serial.print(networkTotal);
+    Serial.print(" | BPM: ");
+    Serial.println(currentBPM);
   } else {
-    Serial.println("[SCAN] Internal Core Timed Out");
+    Serial.println("[SCAN] Failed");
   }
 
-  // Clear network cache frames out of heap storage memory to protect system assets
   WiFi.scanDelete();
 }
 
@@ -157,22 +249,50 @@ void routeState() {
   }
 }
 
+// Change these global variables from long to uint32_t at the top of your code:
+// const uint32_t FINGER_IR_MIN = 50000;
+// uint32_t lastIR = 0;
+
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Give serial hub buffer space to spin up safely
+  Wire.begin(PIN_SDA, PIN_SCL);
+
+  // Use 400000Hz explicitly for fast I2C transfer rate
+  if (particleSensor.begin(Wire, 400000)) { 
+    byte ledBrightness = 0x1F;
+    byte sampleAverage = 4;
+    byte ledMode = 2;
+    int sampleRate = 100;
+    int pulseWidth = 411;
+    int adcRange = 4096;
+
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+    sensorReady = true;
+    Serial.println("[BOOT] MAX30105/2 online");
+  } else {
+    sensorReady = false;
+    Serial.println("[BOOT] Sensor not found");
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
-  Serial.println("[BOOT] Smartwatch Context Router Online.");
+  Serial.println("[BOOT] Context router online");
   startScan();
 }
 
+
 void loop() {
-  unsigned long now = millis(); // Kept unified layout types matching unsigned long variables
+  uint32_t now = millis();
 
   pollScan();
 
   if (!scanInProgress && (now - lastScanMs >= SCAN_INTERVAL_MS)) {
     startScan();
+  }
+
+  if (now - lastSensorMs >= SENSOR_INTERVAL_MS) {
+    lastSensorMs = now;
+    pollSensor(now);
   }
 
   if (now - lastHapticMs >= HAPTIC_INTERVAL_MS) {
@@ -182,9 +302,13 @@ void loop() {
 
   if (now - lastLogMs >= LOG_INTERVAL_MS) {
     lastLogMs = now;
-    Serial.print("[LOG] Total Sniffed: ");
+    Serial.print("[LOG] Total: ");
     Serial.print(networkTotal);
-    Serial.print(" | Active Path: ");
+    Serial.print(" | BPM: ");
+    Serial.print(currentBPM);
+    Serial.print(" | IR: ");
+    Serial.print(lastIR);
+    Serial.print(" | Path: ");
     Serial.println(stateToString(currentState));
   }
 }
